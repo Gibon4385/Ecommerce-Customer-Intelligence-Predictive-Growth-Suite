@@ -22,7 +22,9 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("DATASET_ID")
 
 if not all([SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID]):
-    print("❌ Error: Missing configuration in .env file (SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID).")
+    print(
+        "❌ Error: Missing configuration in .env file (SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID)."
+    )
     sys.exit(1)
 
 # Convert service account path to absolute path
@@ -103,7 +105,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%H:%M:%S",
     )
 
     logger.info("🚀 Initializing Spark Session...")
@@ -154,16 +156,16 @@ def main():
     def write_all_to_bq(batch_df, batch_id):
         # Cache the batch DataFrame in memory to avoid reading from Kafka multiple times
         batch_df.persist()
-        
+
         write_details = []
-        
+
         for topic_name, cfg in topics_config.items():
             topic_df = (
                 batch_df.filter(col("topic") == topic_name)
                 .select(from_json(col("json_str"), cfg["schema"]).alias("data"))
                 .select("data.*")
             )
-            
+
             # Only write if there is data for this topic in the current batch
             count = topic_df.count()
             if count > 0:
@@ -172,10 +174,12 @@ def main():
                     "writeMethod", "direct"
                 ).mode("append").save()
                 write_details.append(f"{topic_name}: {count:,} rows")
-                
+
         if write_details:
-            logger.info(f"⚡ Combined Batch {batch_id} written to BigQuery | {', '.join(write_details)}")
-            
+            logger.info(
+                f"⚡ Combined Batch {batch_id} written to BigQuery | {', '.join(write_details)}"
+            )
+
         # Free memory cache
         batch_df.unpersist()
 
@@ -185,15 +189,18 @@ def main():
 
     # Start the single combined query and write to BigQuery
     query = (
-        records_str.writeStream
-        .foreachBatch(write_all_to_bq)
+        records_str.writeStream.foreachBatch(write_all_to_bq)
         .option("checkpointLocation", checkpoint_path)
-        .option("maxOffsetsPerTrigger", 150000) # Safety limit for peak loads
-        .trigger(processingTime="5 seconds")    # Pack micro-batches to reduce BQ API calls
+        .option("maxOffsetsPerTrigger", 150000)  # Safety limit for peak loads
+        .trigger(
+            processingTime="5 seconds"
+        )  # Pack micro-batches to reduce BQ API calls
         .start()
     )
 
-    logger.info("🎉 Started streaming query. Writing directly to BigQuery raw tables...")
+    logger.info(
+        "🎉 Started streaming query. Writing directly to BigQuery raw tables..."
+    )
     logger.info("Press Ctrl+C in your terminal to stop.")
 
     # Wait for termination of the query
