@@ -61,6 +61,12 @@ practice/
 # Local architecture review document
 CLOUD_ARCHITECTURE_PLAN.md
 
+# Local agent configuration, generated knowledge graph, and private documentation
+.codex/
+docs/
+graphify-out/
+AGENTS.md
+
 # Terraform local state, plans, caches, and manual backups
 terraform/.terraform/
 terraform/*.tfstate
