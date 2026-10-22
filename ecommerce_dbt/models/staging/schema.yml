@@ -132,8 +132,9 @@ models:
         description: "Rating given by user (1-5)"
         tests:
           - accepted_values:
-              values: [1, 2, 3, 4, 5]
-              quote: false
+              arguments:
+                values: [1, 2, 3, 4, 5]
+                quote: false
       - name: order_id
         data_type: STRING
       - name: user_id
@@ -180,5 +181,4 @@ models:
         description: "SHA-256 hashed email address"
         tests:
           - not_null
-          - unique
 

@@ -23,7 +23,7 @@ SELECT MAX(review_date) AS max_date FROM review_with_category
 )
 
 SELECT
-category,
+COALESCE(category, 'Unknown') AS category,
 
 -- 7d
 AVG(CASE
@@ -65,7 +65,7 @@ COUNTIF(review_date >= DATE_SUB(ref_date.max_date, INTERVAL 60 DAY)) AS review_c
   ) }} AS alert_level
 
 FROM review_with_category, ref_date
-GROUP BY category, ref_date.max_date
+GROUP BY COALESCE(category, 'Unknown'), ref_date.max_date
 ORDER BY
 CASE alert_level
 WHEN 'High Risk: Immediate Intervention' THEN 0

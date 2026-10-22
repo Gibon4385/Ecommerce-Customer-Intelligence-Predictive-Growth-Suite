@@ -15,12 +15,12 @@ models:
       +contract:
         enforced: true
       +materialized: view
-      +schema: staging
+      +schema: dbt_ecommerce_staging
     
     intermediate:
       +materialized: view
-      +schema: intermediate
+      +schema: dbt_ecommerce_intermediate
 
     marts:
       +materialized: table
-      +schema: marts
+      +schema: dbt_ecommerce_marts
