@@ -1,0 +1,30 @@
+project_id: your-project-id
+region: asia-east1
+zone: asia-east1-b
+
+pipeline:
+  duration_seconds: 60
+  target_eps: 10
+  startup_timeout_seconds: 900
+  spark_stability_seconds: 30
+  producer_heartbeat_timeout_seconds: 180
+  data_timeout_seconds: 300
+
+monitoring:
+  sample_timeout_seconds: 300
+  poll_interval_seconds: 15
+
+testing:
+  # E2E 不依賴真實 Google Groups，避免 example.com placeholder 造成 apply 失敗。
+  enable_human_iam: false
+  enable_email_notifications: false
+
+# 主動注入 malformed Kafka message 需要 runner 本身能連到 Kafka 私有 IP。
+# 從一般本機執行時請維持 false；該項檢查會清楚標記為 SKIP。
+private_kafka_reachable: false
+
+# 測試預期由 dbt 建立的資料集。實際 model 名稱會從 repo 掃描後比對。
+dbt_datasets:
+  staging: dbt_ecommerce_staging
+  intermediate: dbt_ecommerce_intermediate
+  marts: dbt_ecommerce_marts

@@ -1,0 +1,6 @@
+{
+  "gcs_freshness_seconds": 45,
+  "spark_failed_batches": 0,
+  "recovery_seconds": 300,
+  "notes": "Record values from Cloud Monitoring for the exact run window. recovery_seconds is required only for the recovery scenario."
+}

@@ -1,0 +1,59 @@
+scenarios:
+  smoke:
+    target_eps: 5
+    duration_seconds: 10
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.80
+      max_delivery_errors: 0
+
+  baseline:
+    target_eps: 10
+    duration_seconds: 900
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.90
+      max_delivery_errors: 0
+      max_gcs_freshness_seconds: 120
+      max_spark_failed_batches: 0
+
+  expected:
+    target_eps: 50
+    duration_seconds: 1800
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.90
+      max_delivery_errors: 0
+      max_gcs_freshness_seconds: 120
+      max_spark_failed_batches: 0
+
+  peak:
+    target_eps: 100
+    duration_seconds: 900
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.90
+      max_delivery_errors: 0
+      max_gcs_freshness_seconds: 120
+      max_spark_failed_batches: 0
+
+  stress:
+    target_eps: 200
+    duration_seconds: 900
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.85
+      max_delivery_errors: 0
+      max_gcs_freshness_seconds: 120
+      max_spark_failed_batches: 0
+
+  recovery:
+    target_eps: 10
+    duration_seconds: 600
+    seed: 42
+    thresholds:
+      min_eps_ratio: 0.90
+      max_delivery_errors: 0
+      max_gcs_freshness_seconds: 120
+      max_spark_failed_batches: 0
+      max_recovery_seconds: 600

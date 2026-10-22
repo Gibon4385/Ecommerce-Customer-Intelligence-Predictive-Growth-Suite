@@ -1,8 +1,10 @@
+import argparse
 import os
+import subprocess
 import pandas as pd
-import pandas_gbq
 from google.oauth2 import service_account
-from google.cloud import bigquery
+import google.auth
+from google.cloud import storage
 from dotenv import load_dotenv
 
 # Load .env file
@@ -12,64 +14,55 @@ load_dotenv()
 # Load sensitive data from .env
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 PROJECT_ID = os.getenv("PROJECT_ID")
-DATASET_ID = os.getenv("DATASET_ID")
+DATA_LAKE_BUCKET = os.getenv("DATA_LAKE_BUCKET")
 
-if not all([SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID]):
+if not all([PROJECT_ID, DATA_LAKE_BUCKET]):
     raise RuntimeError(
-        "Error: Please ensure SERVICE_ACCOUNT_JSON, PROJECT_ID, and DATASET_ID are set in the .env file"
+        "Error: Set PROJECT_ID and DATA_LAKE_BUCKET in .env"
     )
 
 # Mapping of source files to BigQuery table names
 DATA_FILES = {
-    "data/events.csv": "raw_events",
-    "data/order_items.csv": "raw_order_items",
-    "data/orders.csv": "raw_orders",
-    "data/products.csv": "raw_products",
-    "data/reviews.csv": "raw_reviews",
-    "data/users.csv": "raw_users",
+    "data/events.csv": "events",
+    "data/order_items.csv": "order_items",
+    "data/orders.csv": "orders",
+    "data/products.csv": "products",
+    "data/reviews.csv": "reviews",
+    "data/users.csv": "users",
 }
 # ===============================================
 
 
 def main():
-    # 1. Verify if the credentials file exists
-    if not os.path.exists(SERVICE_ACCOUNT_JSON):
-        raise FileNotFoundError(
-            f"Service Account key not found, please check path: {SERVICE_ACCOUNT_JSON}"
-        )
-
-    # 2. Load credentials
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_JSON
+    parser = argparse.ArgumentParser(description="Upload historical CSV fixtures as raw Parquet")
+    parser.add_argument(
+        "--upload-with-gcloud",
+        action="store_true",
+        help="Use the active gcloud identity instead of SERVICE_ACCOUNT_JSON/ADC",
     )
+    args = parser.parse_args()
 
-    # Initialize BigQuery Client to check/create dataset
-    client = bigquery.Client(credentials=credentials, project=PROJECT_ID)
+    # Prefer Application Default Credentials in Google Cloud. A local key file
+    # remains supported for development only.
+    bucket = None
+    if not args.upload_with_gcloud:
+        if SERVICE_ACCOUNT_JSON:
+            credentials = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_JSON
+            )
+        else:
+            credentials, _ = google.auth.default()
+
+        client = storage.Client(credentials=credentials, project=PROJECT_ID)
+        bucket = client.bucket(DATA_LAKE_BUCKET)
 
     print(
-        f"🚀 Starting data ingestion to GCP Project: {PROJECT_ID} (Dataset: {DATASET_ID})"
+        f"🚀 Uploading historical data to gs://{DATA_LAKE_BUCKET}/raw"
     )
 
-    # 3. Ensure Dataset exists
-    dataset_ref = bigquery.DatasetReference(PROJECT_ID, DATASET_ID)
-    try:
-        client.get_dataset(dataset_ref)
-        print(f"✅ Dataset {DATASET_ID} already exists.")
-    except Exception:
-        print(f"ℹ️ Dataset {DATASET_ID} not found. Attempting to create it...")
-        try:
-            dataset = bigquery.Dataset(dataset_ref)
-            dataset.location = "US"  # Adjust location if needed
-            client.create_dataset(dataset)
-            print(f"✅ Dataset {DATASET_ID} created successfully.")
-        except Exception as e:
-            print(f"❌ Failed to create or access dataset: {e}")
-            print(
-                "Please ensure your Service Account has 'BigQuery Data Editor' and 'BigQuery User' roles."
-            )
-            return
-
-    # 4. Loop through files and upload
+    # Convert historical CSV files to Parquet in the same raw-zone layout used
+    # by Structured Streaming, then upload them to GCS.
+    errors = 0
     for file_name, table_name in DATA_FILES.items():
         if os.path.exists(file_name):
             print("--------------------------------------------------")
@@ -79,29 +72,41 @@ def main():
             df = pd.read_csv(file_name, low_memory=False)
 
             # ELT best practice: Ingest raw data as-is
-            destination = f"{DATASET_ID}.{table_name}"
-            print(f"📤 Uploading to BigQuery -> {destination} ({len(df)} rows)...")
+            destination = f"raw/{table_name}/historical.parquet"
+            parquet_file = f"/tmp/{table_name}.parquet"
+            print(f"📤 Uploading {len(df)} rows to gs://{DATA_LAKE_BUCKET}/{destination}")
 
             try:
-                pandas_gbq.to_gbq(
-                    df,
-                    destination_table=destination,
-                    project_id=PROJECT_ID,
-                    credentials=credentials,
-                    if_exists="replace",
-                )
+                df.to_parquet(parquet_file, index=False)
+                if args.upload_with_gcloud:
+                    subprocess.run(
+                        [
+                            "gcloud", "storage", "cp", parquet_file,
+                            f"gs://{DATA_LAKE_BUCKET}/{destination}",
+                            f"--project={PROJECT_ID}",
+                        ],
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    )
+                else:
+                    bucket.blob(destination).upload_from_filename(parquet_file)
                 print(f"✅ {table_name} uploaded successfully!")
             except Exception as e:
+                errors += 1
                 print(f"❌ Error uploading {table_name}: {e}")
                 if "403" in str(e):
-                    print(
-                        "Hint: This is likely a permission issue. Ensure the Service Account has 'BigQuery Data Editor' role on the project."
-                    )
+                    print("Hint: grant Storage Object User on the data-lake bucket.")
         else:
             print(f"⚠️ File {file_name} not found, skipping.")
 
-    print("\n🎉 All data ingestion completed! You can check the BigQuery console now.")
+    if errors:
+        print(f"\n❌ Historical ingestion failed for {errors} table(s).")
+        return 1
+
+    print("\n🎉 Historical data is now available in the GCS raw zone.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

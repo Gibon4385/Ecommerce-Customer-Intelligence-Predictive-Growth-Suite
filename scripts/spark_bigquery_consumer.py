@@ -1,9 +1,9 @@
 import os
-import sys
 import logging
-from dotenv import load_dotenv
+import argparse
+import time
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, current_timestamp, from_json, lit
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -13,35 +13,6 @@ from pyspark.sql.types import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
-
-SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
-PROJECT_ID = os.getenv("PROJECT_ID")
-DATASET_ID = os.getenv("DATASET_ID")
-
-if not all([SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID]):
-    print(
-        "❌ Error: Missing configuration in .env file (SERVICE_ACCOUNT_JSON, PROJECT_ID, DATASET_ID)."
-    )
-    sys.exit(1)
-
-# Convert service account path to absolute path
-SERVICE_ACCOUNT_ABS_PATH = os.path.abspath(SERVICE_ACCOUNT_JSON)
-if not os.path.exists(SERVICE_ACCOUNT_ABS_PATH):
-    print(f"❌ Error: Service Account JSON not found at {SERVICE_ACCOUNT_ABS_PATH}")
-    sys.exit(1)
-
-# Set Google Application Credentials env variable for BigQuery Auth
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SERVICE_ACCOUNT_ABS_PATH
-
-# Checkpoint Directory
-CHECKPOINT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spark_checkpoints"
-)
-if not os.path.exists(CHECKPOINT_DIR):
-    os.makedirs(CHECKPOINT_DIR)
 
 # Define schemas for each topic
 users_schema = StructType(
@@ -101,6 +72,22 @@ reviews_schema = StructType(
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Stream Kafka ecommerce events into the GCS data lake"
+    )
+    parser.add_argument(
+        "--bootstrap-servers",
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+    )
+    parser.add_argument(
+        "--data-lake-uri",
+        default=os.getenv("DATA_LAKE_URI"),
+        help="GCS URI such as gs://PROJECT-ecommerce-lake",
+    )
+    args = parser.parse_args()
+    if not args.data_lake_uri or not args.data_lake_uri.startswith("gs://"):
+        parser.error("--data-lake-uri (or DATA_LAKE_URI) must be a gs:// URI")
+
     # Configure logging
     logging.basicConfig(
         level=logging.INFO,
@@ -110,88 +97,134 @@ def main():
 
     logger.info("🚀 Initializing Spark Session...")
 
-    # We specify the Spark Kafka & BigQuery Connector dependencies.
-    # PySpark will download these JARs automatically.
-    spark = (
-        SparkSession.builder.appName("EcommerceBigQueryStreaming")
-        .config("spark.driver.bindAddress", "127.0.0.1")
-        .config("spark.driver.host", "127.0.0.1")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.google.cloud.spark:spark-3.5-bigquery:0.44.2",
-        )
-        .getOrCreate()
-    )
+    # Connector packages are supplied by spark-submit so the correct Scala
+    # build is selected for the Managed Spark cluster runtime.
+    spark = SparkSession.builder.appName("EcommerceLakeStreaming").getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
     logger.info("✅ Spark Session initialized successfully.")
 
     # Read from Kafka multi-topic stream
-    kafka_bootstrap_servers = os.environ.get(
-        "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"
-    )
+    kafka_bootstrap_servers = args.bootstrap_servers
     logger.info(f"🔌 Connecting to Kafka broker at {kafka_bootstrap_servers}...")
     kafka_stream = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", kafka_bootstrap_servers)
         .option("subscribe", "db_users,db_events,db_orders,db_order_items,db_reviews")
         .option("startingOffsets", "latest")
+        .option("maxOffsetsPerTrigger", 150000)
         .option("failOnDataLoss", "false")  # Avoid crash on offset loss
         .load()
     )
 
-    # Cast value to string and select topic
-    records_str = kafka_stream.selectExpr("CAST(value AS STRING) as json_str", "topic")
+    # Preserve Kafka metadata while it is still available. These fields provide
+    # ingestion lineage and deterministic evidence for troubleshooting in dbt.
+    records_str = kafka_stream.selectExpr(
+        "CAST(value AS STRING) AS json_str",
+        "topic AS _source_topic",
+        "partition AS _kafka_partition",
+        "offset AS _kafka_offset",
+        "timestamp AS _kafka_timestamp",
+    )
 
-    # Define mapping of topics to schema and destination BQ table names
+    # Topic-to-lake mapping. BigQuery external tables expose these Parquet files
+    # under the existing raw_ecommerce.raw_* names consumed by dbt.
     topics_config = {
-        "db_users": {"schema": users_schema, "table": "raw_users"},
-        "db_events": {"schema": events_schema, "table": "raw_events"},
-        "db_orders": {"schema": orders_schema, "table": "raw_orders"},
-        "db_order_items": {"schema": order_items_schema, "table": "raw_order_items"},
-        "db_reviews": {"schema": reviews_schema, "table": "raw_reviews"},
+        "db_users": {"schema": users_schema, "path": "users", "id": "user_id"},
+        "db_events": {"schema": events_schema, "path": "events", "id": "event_id"},
+        "db_orders": {"schema": orders_schema, "path": "orders", "id": "order_id"},
+        "db_order_items": {
+            "schema": order_items_schema,
+            "path": "order_items",
+            "id": "order_item_id",
+        },
+        "db_reviews": {"schema": reviews_schema, "path": "reviews", "id": "review_id"},
     }
 
-    # Combined writer that writes all topics within a single micro-batch to BigQuery
-    def write_all_to_bq(batch_df, batch_id):
+    # Combined writer that writes all topics within a single micro-batch to GCS.
+    def write_all_to_lake(batch_df, batch_id):
+        batch_started = time.monotonic()
         # Cache the batch DataFrame in memory to avoid reading from Kafka multiple times
         batch_df.persist()
 
         write_details = []
+        total_records = 0
+        total_rejected = 0
 
         for topic_name, cfg in topics_config.items():
-            topic_df = (
-                batch_df.filter(col("topic") == topic_name)
-                .select(from_json(col("json_str"), cfg["schema"]).alias("data"))
-                .select("data.*")
+            parsed_df = (
+                batch_df.filter(col("_source_topic") == topic_name)
+                .withColumn("data", from_json(col("json_str"), cfg["schema"]))
+                .persist()
+            )
+
+            invalid_condition = col("data").isNull() | col("data")[cfg["id"]].isNull()
+            invalid_df = parsed_df.filter(invalid_condition).select(
+                "json_str",
+                "_source_topic",
+                "_kafka_partition",
+                "_kafka_offset",
+                "_kafka_timestamp",
+                lit("invalid_json_or_missing_primary_id").alias("_rejection_reason"),
+                current_timestamp().alias("_rejected_at"),
+            )
+            rejected_count = invalid_df.count()
+            if rejected_count > 0:
+                quarantine = (
+                    f"{args.data_lake_uri.rstrip('/')}/quarantine/{cfg['path']}"
+                )
+                invalid_df.write.mode("append").parquet(quarantine)
+                total_rejected += rejected_count
+
+            topic_df = parsed_df.filter(~invalid_condition).select(
+                "data.*",
+                "_source_topic",
+                "_kafka_partition",
+                "_kafka_offset",
+                "_kafka_timestamp",
+                current_timestamp().alias("_ingested_at"),
             )
 
             # Only write if there is data for this topic in the current batch
             count = topic_df.count()
             if count > 0:
-                dest_table = f"{PROJECT_ID}.{DATASET_ID}.{cfg['table']}"
-                topic_df.write.format("bigquery").option("table", dest_table).option(
-                    "writeMethod", "direct"
-                ).mode("append").save()
+                destination = f"{args.data_lake_uri.rstrip('/')}/raw/{cfg['path']}"
+                topic_df.write.mode("append").parquet(destination)
                 write_details.append(f"{topic_name}: {count:,} rows")
+                total_records += count
+
+            parsed_df.unpersist()
 
         if write_details:
+            batch_duration_seconds = time.monotonic() - batch_started
             logger.info(
-                f"⚡ Combined Batch {batch_id} written to BigQuery | {', '.join(write_details)}"
+                f"⚡ Batch {batch_id} written to GCS | {', '.join(write_details)}"
+            )
+            logger.info(
+                "PIPELINE_HEARTBEAT component=spark_gcs "
+                f"batch_id={batch_id} input_records={total_records + total_rejected} "
+                f"records={total_records} "
+                f"rejected={total_rejected} duration_seconds={batch_duration_seconds:.3f}"
+            )
+
+        if total_rejected:
+            logger.warning(
+                "DATA_QUALITY component=spark_quarantine batch_id=%s rejected=%s",
+                batch_id,
+                total_rejected,
             )
 
         # Free memory cache
         batch_df.unpersist()
 
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, "combined")
+    checkpoint_path = f"{args.data_lake_uri.rstrip('/')}/checkpoints/kafka-to-gcs"
 
-    logger.info("📡 Setting up combined stream: Kafka ➔ BigQuery")
+    logger.info("📡 Setting up combined stream: Kafka ➔ GCS data lake")
 
-    # Start the single combined query and write to BigQuery
+    # Start one checkpointed query for the combined Kafka stream.
     query = (
-        records_str.writeStream.foreachBatch(write_all_to_bq)
+        records_str.writeStream.foreachBatch(write_all_to_lake)
         .option("checkpointLocation", checkpoint_path)
-        .option("maxOffsetsPerTrigger", 150000)  # Safety limit for peak loads
         .trigger(
             processingTime="5 seconds"
         )  # Pack micro-batches to reduce BQ API calls
@@ -199,7 +232,7 @@ def main():
     )
 
     logger.info(
-        "🎉 Started streaming query. Writing directly to BigQuery raw tables..."
+        "🎉 Started streaming query. Writing Parquet files to the GCS raw zone..."
     )
     logger.info("Press Ctrl+C in your terminal to stop.")
 

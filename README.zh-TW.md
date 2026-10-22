@@ -15,7 +15,8 @@
 * **企業級 CI/CD 與 Slim CI**：利用 GitHub Actions 與 GCP Workload Identity Federation (無金鑰驗證)，搭配 Slim CI 僅測試修改的 dbt 模型，**BigQuery 節點運算成本降低 90% 以上**。
 * **零查詢成本監控 (Zero-Query-Cost)**：Airflow 每日自動調度，並透過解析本地 `run_results.json` 產出執行日報與即時 Slack/Email 警報，**不對 BigQuery 發起任何額外查詢**。
 * **隱私安全合規 (PII Protection)**：Staging 層移除敏感 Email，採 SHA-256 進行不可逆雜湊，並透過 Terraform 實施 BigQuery 資料集層級 (Raw/Staging/Marts) 的精細化 IAM 權限控管。
-* **雲端生產級容器編排 (GKE & Terraform)**：使用 Terraform 一鍵佈署 VPC 與自動縮放的 GKE 叢集，並以 Kubernetes 容器化技術部署 Kafka 串流、Postgres PVC 與 Airflow KubernetesExecutor (整合 git-sync)。
+* **務實的雲端串流架構**：持續運行的 Python producer 使用 Cloud Run Worker Pool；Kafka 部署於私有 Compute Engine 單節點 VM；Structured Streaming 使用小型單節點 Managed Spark Cluster，不使用 Kubernetes。
+* **GCS Data Lake + BigQuery Lakehouse 查詢**：Spark 將原始事件以 Parquet 寫入 GCS，BigQuery external tables 以既有的 `raw_ecommerce` dataset 對外提供查詢，dbt 可直接轉換 lake 中的資料。
 
 ---
 
@@ -23,14 +24,14 @@
 
 | 層級 | 技術與工具 |
 |---|---|
-| **數據倉庫 (Data Warehouse)** | Google BigQuery |
+| **Data Lake / 數據倉庫** | Google Cloud Storage (Parquet)、Google BigQuery external tables |
 | **數據轉換 (Data Transformation)** | dbt (SQL), Python |
 | **數據管道 / 串流 (Streaming Pipeline)** | Apache Kafka, Apache Spark (Structured Streaming) |
 | **機器學習 (Machine Learning)** | BigQuery ML (XGBoost/迴歸模型), Scikit-learn, Pandas |
 | **自然語言處理 (NLP)** | VADER (情緒分析) |
 | **自動化調度 (Orchestration)** | Apache Airflow |
 | **基礎設施即程式碼 (IaC)** | Terraform |
-| **容器編排 (Orchestration)** | Google Kubernetes Engine (GKE), Docker, Kubernetes |
+| **雲端執行環境** | Cloud Run Worker Pools、Compute Engine、Docker |
 | **BI 與視覺化 (BI & Visualization)** | LightDash (相容 Looker) |
 
 ---
@@ -38,17 +39,20 @@
 ## 📐 系統架構圖 (System Architecture)
 
 ```
-[原始 CSV 歷史數據]                [即時模擬數據 (Faker + Python)]
-       │                                     │
-       │                                     ▼ (即時寫入)
-       │                              Apache Kafka (訊息佇列)
-       │                                     │
-       │ (批次載入)                           ▼ (即時串流消費)
-       │                              Apache Spark (Structured Streaming)
-       │                                     │
-       └───────────────────┬─────────────────┘
-                           ▼
-                 Google BigQuery (raw_ecommerce 資料集)
+[歷史原始 CSV]       [Cloud Run Worker Pool：Python Producer]
+       │                                │ 持續產生事件
+       │                                ▼
+       │                 私有 Compute Engine VM 上的 Kafka
+       │                                │
+       │                                ▼
+       │              Managed Spark Cluster Structured Streaming
+       │                                │ Parquet + GCS checkpoints
+       └────────────────┬───────────────┘
+                        ▼
+                 GCS Data Lake（raw zone）
+                        │
+                        ▼
+            BigQuery external tables（raw_ecommerce）
                            │
                            ▼
                        dbt Staging
@@ -74,13 +78,29 @@
 
 ## 💾 數據流與建模設計 (Data & Modeling Design)
 
-### 1. dbt 分層架構 (dbt Layer Design)
+### 1. Spark 與 dbt 的責任邊界
+
+Spark 負責只有在 Kafka 即時攝取入口才能取得、且必須立刻處理的技術工作；dbt 負責可重跑的 warehouse transformation 與商業語意。
+
+| Spark Structured Streaming | BigQuery 上的 dbt |
+|---|---|
+| 讀取 Kafka topics，透過 GCS checkpoint 管理 offsets | 依每個 entity 的 business primary key 去重 |
+| 使用各 topic 的明確 schema 解析 JSON | 統一日期、數字、欄位與 null handling |
+| 保留 Kafka topic、partition、offset、timestamp lineage | 執行 unique、not-null、relationships、accepted-values 等測試 |
+| 將 malformed record 或缺少 primary ID 的資料寫入 `gs://.../quarantine/<entity>/` | 移除／雜湊 PII，套用可重複使用的資料品質規則 |
+| 將有效資料以 append-only Parquet 寫入 GCS raw zone | 建立 staging、intermediate features 與 business marts |
+
+RFM、churn、cohort、LTV、product health 與 marketing recommendation 等商業規則刻意保留在 dbt，因為 SQL models 較容易 review、test、backfill 與 rerun。Spark 不做 dimension joins 或 business KPI，避免產生兩套互相競爭的 transformation logic。
+
+Raw external tables 會提供 `_source_topic`、`_kafka_partition`、`_kafka_offset`、`_kafka_timestamp`、`_ingested_at` 等 ingestion metadata。歷史檔案並非來自 Kafka，因此這些欄位可以是 null。
+
+### 2. dbt 分層架構 (dbt Layer Design)
 本專案遵循嚴格的 dbt 三層架構，每一層都有明確的職責：
 * **Staging (`stg_`)** — 對原始資料進行輕量清洗與標準化（例如 [stg_users.sql](ecommerce_dbt/models/staging/stg_users.sql)）。此層不包含業務邏輯，僅負責統一命名規範與資料型別，並實施敏感資訊遮蔽。
 * **Intermediate (`int_`)** — 業務邏輯的核心所在。此層負責計算 RFM 分數 (`int_rfm_scores`)、留存同期群特徵 (`int_cohort_base`) 以及 LTV 訓練特徵 (`int_ltv_training_features`)，將邏輯與最終展現分離以確保模型複用性。
 * **Marts (`mart_`)** — 直接面向商業應用的資料表：例如 `mart_c360_table` (客戶全視角畫像) 與 `mart_business_recommendations` (商業建議)。這是 CRM 與行銷團隊真正查詢的對象。
 
-### 2. 機器學習與 AI 應用
+### 3. 機器學習與 AI 應用
 * **LTV 價值預測 (BigQuery ML)**：利用客戶的 RFM 特徵與歷史購買行為，透過回歸模型預測每位客戶未來 90 天的預期營收。預測結果直接驅動預算分配邏輯：高 LTV 客戶將獲得高成本的留存服務，低 LTV 客戶則導入低成本的自動化溝通流程。
 * **NLP 情緒分析 (Python / VADER)**：處理客戶評論，萃取情緒標籤與產品痛點。系統會將帶有負面情緒的高價值客戶標記為客服優先處理個案，在客戶真正流失前捕捉危險訊號。
 
@@ -104,12 +124,15 @@
 * **調度策略**：每日凌晨 01:00 (台北時間) 自動執行，DAG 設計見 [ecommerce_dbt_dag.py](airflow/dags/ecommerce_dbt_dag.py)。設有 3 次自動重試與任務失敗即時警報機制（`on_failure_callback`），出錯時自動向運維團隊寄送精美 HTML 報錯信件。
 * **零查詢成本監控日報 (Zero-Query-Cost)**：在 dbt 流程執行完畢後，Airflow 會直接解析本地生成的 `run_results.json` 狀態檔案進行報表編譯並發送 Email/Slack，**完全無需對 BigQuery 進行二次查詢，從而達到零成本的日常監控**。
 
-### 4. 雲端生產部署藍圖 (Kubernetes & IaC)
-* **Terraform IaC**：定義於 [gke.tf](deploy/terraform/gke.tf)，一鍵在 GCP 佈署專屬 VPC 網路與自動彈性縮放（1-5 節點）的 GKE 叢集。
-* **Kubernetes 容器編排**：
-  - **Airflow KubernetesExecutor**：啟用任務級 Pod 動態縮放，並使用 `git-sync` 每 60 秒自動從 GitHub 同步 DAG 代碼，無須重構 Docker 映像檔。
-  - **Strimzi Kafka Operator**：一鍵部署 3 節點的 Kafka 與 Zookeeper 高可用叢集。
-  - **Postgres PVC**：使用 PersistentVolumeClaim 動態申請 GCP 雲端儲存，確保資料庫持久化。
+### 4. 雲端串流部署（不使用 Kubernetes）
+* **持續運行的 Producer**：[producer.Dockerfile](producer.Dockerfile) 將 producer 容器化並部署為 Cloud Run Worker Pool。它是常駐程序而不是一次性排程任務，因此不使用 Cloud Scheduler 反覆啟動。
+  Image 可由內建的 demo 商品目錄自行啟動，不會將被忽略的本機歷史 CSV 包進 image。
+* **Compute Engine Kafka**：Terraform 建立一台私有 Kafka VM 與獨立 persistent disk，9092 僅允許 streaming subnet 存取。此設計刻意以作品集規模的成本與簡潔性優先，不提供 broker HA。
+* **為何不使用 Google Managed Service for Apache Kafka？** Managed Kafka 適合需要高可用與降低維運負擔的正式環境，但其區域、多 zone 容量對本專案的小量虛擬資料成本過高。單 VM 仍可完整展示 Kafka protocol 與維運概念，但明確接受 single point of failure，因此不宣稱為 production HA 架構。
+* **Managed Spark Structured Streaming**：Terraform 建立常駐單節點 Managed Spark Cluster，[submit.sh](deploy/managed-spark/submit.sh) 提交可重新啟動的長時間 consumer。GCS checkpoint 可在失敗後接續 Kafka offset。
+* **僅供技術展示，並非 production HA**：單節點 cluster 刻意採小型配置，用於展示 Spark Structured Streaming；它沒有 master 或 worker redundancy，不得描述為 production high-availability 架構。
+* **正式環境替代方案 — Dataflow**：如果沒有展示 Spark 的要求，可改用持續代管的 Dataflow streaming pipeline 處理 Kafka 到 GCS／BigQuery，降低 cluster lifecycle 維運工作。
+* **Data Lake 查詢**：Spark 寫入 `gs://<project>-ecommerce-lake/raw/<entity>/`，Terraform 建立與 dbt 現有 source 相同名稱的 `raw_ecommerce.raw_*` BigQuery external tables。
 
 ---
 
@@ -133,7 +156,7 @@
 /scripts            # Python 數據導入與預處理腳本
 /ipynb              # LTV 建模與情緒分析的 Jupyter Notebooks
 /agents             # CRM AI 代理人邏輯
-/deploy             # 雲端生產環境部署藍圖 (Terraform & Kubernetes Manifests)
+/deploy             # Kafka VM Compose、Cloud Run 與 Managed Spark 部署工具
 /memo               # 架構設計文件、規劃筆記與詳細部署指引
 /dashboard_preview  # 儀表板版面草案 (高層概覽、分群分析)
 ```
@@ -142,9 +165,7 @@
 
 ## ⚡ 本地快速啟動指引 (Local Quick Start)
 
-本專案支援兩種本地數據基礎設施啟動方式：
-
-### 方案 A：使用 Docker Compose (預設、最輕量)
+本機開發環境使用 Docker Compose 啟動 Kafka。
 
 1. **啟動基礎設施** (Zookeeper, Kafka, Kafka UI):
    ```bash
@@ -166,35 +187,56 @@
       ```bash
       python scripts/run_kafka_producer.py --log-level DEBUG --delay 1.0
       ```
-    * **終端機 2 (PySpark 串流消費者，寫入 BigQuery)**:
+    * **終端機 2（PySpark 串流消費者，將 Parquet 寫入 GCS）**:
       ```bash
-      python scripts/spark_bigquery_consumer.py
+      spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+        scripts/spark_bigquery_consumer.py \
+        --data-lake-uri="gs://YOUR_PROJECT-ecommerce-lake"
       ```
 
-### 方案 B：使用 Kubernetes (本地 K8s 部署)
+## ☁️ 雲端部署概要
 
-1. **一鍵部署 Postgres 與 Kafka 叢集**:
-   ```bash
-   # 部署資料庫與 PVC 儲存卷
-   kubectl apply -f deploy/k8s/postgres.yaml
-   # 部署 1-Node KRaft Kafka 叢集與 Topics (將對外暴露 NodePort 30094 & 30095)
-   kubectl apply -f deploy/k8s/kafka.yaml
-   ```
-2. **數據初始化與補齊**:
-   ```bash
-   python scripts/run_gap_filler.py --action gap-fill
-   ```
-3. **執行即時串流管道 (指定 K8s Kafka Port)** (請開啟兩個終端機視窗執行):
-   * **終端機 1 (模擬數據生產者)**:
-     ```bash
-     KAFKA_BOOTSTRAP_SERVERS="localhost:30094" python scripts/run_kafka_producer.py --delay 1.0
-     ```
-   * **終端機 2 (PySpark 串流消費者，寫入 BigQuery)**:
-     ```bash
-     KAFKA_BOOTSTRAP_SERVERS="localhost:30094" python scripts/spark_bigquery_consumer.py
-     ```
+`terraform/` 是一個 root module。Terraform 會一起載入目錄內所有 `.tf`，檔名只負責依領域整理設定：`providers.tf`、`versions.tf` 定義工具；`networking.tf`、`kafka.tf`、`dataproc.tf`、`storage.tf`、`bigquery.tf`、`iam.tf`、`monitoring.tf`、`cicd.tf` 分類資源；所有輸出集中於 `outputs.tf`。本專案刻意不保留具有「入口」假象的 `main.tf`。
 
-⚠️ **注意**：若在方案 A 與方案 B 之間切換，請務必先執行 `rm -rf spark_checkpoints` 刪除舊的 Spark Offset 快取，避免因 Kafka 叢集重置導致 Offset 不一致而報錯。
+1. 在 `terraform/` 執行 `terraform apply`，建立私有網路、Kafka VM 與磁碟、GCS lake、service account、BigQuery external tables，以及原有 dbt 基礎設施。
+2. 設定 `PROJECT_ID` 與 Terraform output 提供的 `KAFKA_BOOTSTRAP_SERVERS`，再執行 `deploy/cloud-run/deploy-producer.sh`；它會建置 image 並部署一個使用 Direct VPC egress 的 Worker Pool instance。
+3. 設定 `PROJECT_ID`、`KAFKA_BOOTSTRAP_SERVERS`，以及選用的 `REGION`／`CLUSTER_NAME` 後，執行 `deploy/managed-spark/submit.sh`。Structured Streaming job 會持續運行於常駐 cluster，失敗重啟後沿用 GCS checkpoint。
+4. 透過 `scripts/ingest_raw_data.py` 將歷史 CSV 上傳至相同的 lake 目錄；dbt 繼續從 BigQuery `raw_ecommerce.raw_*` external tables 讀取。
+
+Kafka endpoint 僅供私有網路使用。請勿建立公開的 9092 firewall rule；Cloud Run、Kafka 與 Managed Spark Cluster 使用相同 VPC subnet。
+
+### 安全、IAM 與監控
+
+Terraform 建立四個彼此獨立的 workload identity，全程不使用共用 service-account key 檔案：
+
+| 身份 | 用途 | 主要權限 |
+|---|---|---|
+| `producer-worker` | 持續運行的 Cloud Run producer | 寫入 logs 與 metrics |
+| `kafka-broker` | Kafka VM 與 Ops Agent | 寫入 logs 與 metrics |
+| `spark-streaming` | Dataproc Structured Streaming | Dataproc worker 與 Data Lake object 存取 |
+| `ecommerce-dataset` | dbt（透過 Workload Identity Federation） | BigQuery jobs/data、dbt artifacts 與 Monitoring metric writes |
+
+人員權限透過 additive IAM members 指派給 `data-platform-developers@example.com` 與 `data-platform-operators@example.com`。這兩個地址是設定範例：Google Workspace／Cloud Identity 管理員必須先建立 Groups、將 Terraform variables 換成實際網域，並允許接收 `alerting-noreply@google.com` 的郵件。Terraform 會建立 Email notification channels，但 Google 仍可能要求驗證通知信箱。
+
+Kafka startup script 會安裝 Google Cloud Ops Agent，收集 Kafka JMX 與主機 metrics。自訂的 **Ecommerce streaming pipeline health** dashboard 涵蓋完整路徑：Producer 與 Spark-to-GCS heartbeat、Kafka CPU／磁碟、Cloud Run instances、Dataproc job state、Spark input／processed／rejected records、batch duration，以及 dbt run success、failed models/tests、duration、last success 和 source freshness。以下五項告警會同時寄給兩個 Groups：
+
+1. Producer heartbeat 中斷 10 分鐘。
+2. Kafka VM uptime metric 中斷 5 分鐘。
+3. Kafka 檔案系統使用率超過 85% 且持續 5 分鐘。
+4. Dataproc streaming job 進入 `ERROR`。
+5. Spark-to-GCS 成功 micro-batch 中斷 15 分鐘（作為 GCS freshness 訊號）。
+
+Heartbeat 告警必須等 Producer 與 Spark job 至少送出第一筆 heartbeat 後才具有判斷意義。本部署刻意採用單台 Kafka VM 與單節點 Dataproc Cluster 作為作品集展示，兩者都不是 production HA。正式環境應採 managed／replicated Kafka；若不需要特別展示 Spark，也可依需求改用 Google 提供的 Dataflow Kafka template／pipeline。
+
+Spark dashboard metrics 從固定格式 heartbeat logs 擷取。Production dbt build 完成後，[publish_dbt_metrics.py](scripts/publish_dbt_metrics.py) 解析 `run_results.json` 與 source-freshness `sources.json`，再透過 Application Default Credentials 寫入 `custom.googleapis.com/dbt/*`。GitHub CD 與 Airflow DAG 都使用同一支 publisher；dbt service account 只額外取得此用途所需的 `monitoring.metricWriter`。每個 workload 送出第一筆 sample 前，對應 dashboard tile 會保持空白。
+
+### 容量測試
+
+可重複執行的 Kafka-to-GCS 負載情境位於 [tests/load](tests/load/README.md)。Runner 以 `--target-eps`、`--duration-seconds`、`--run-id`、`--metrics-output` 呼叫正式 Producer，因此測試與部署使用相同的資料產生及傳送路徑。第一階段驗收目標為 50 EPS 持續 30 分鐘，尖峰驗證為 100 EPS 持續 15 分鐘。雲端測試應由 streaming private subnet 內的臨時 VM 執行，再把 Producer summary 與 dashboard 上的 Spark batch、GCS freshness 觀測值一起驗收。Stress test 必須人工啟動，不放入 PR CI。
+
+### 雲端端到端驗收
+
+[tests/cloud_e2e/README.md](tests/cloud_e2e/README.md) 是完整的繁體中文操作手冊，涵蓋 GCP 自動部署、私有網路／IAM、短時間 Producer→Kafka→Spark→GCS smoke test、BigQuery/dbt 三層 materialization、Monitoring time-series、測試報告與 guarded cleanup。完整測試要求輸入完全一致的 project ID 作為破壞性操作確認，並預設在結束或失敗時清理，避免測試資源持續計費。
 
 ---
 
