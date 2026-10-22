@@ -93,7 +93,23 @@ class StatefulEcommerceGenerator:
 
     def _load_products(self):
         if not os.path.exists(PRODUCTS_CSV):
-            raise FileNotFoundError(f"Missing products.csv at {PRODUCTS_CSV}")
+            # Cloud Run images intentionally do not contain the ignored local
+            # history files. This small catalog lets the synthetic producer
+            # bootstrap independently; historical data is loaded into GCS by
+            # ingest_raw_data.py instead.
+            return [
+                {
+                    "product_id": f"P{i:04d}",
+                    "product_name": f"Demo Product {i}",
+                    "category": ["Electronics", "Home", "Beauty", "Sports"][
+                        (i - 1) % 4
+                    ],
+                    "brand": f"Demo Brand {((i - 1) % 5) + 1}",
+                    "price": float(10 + i * 7),
+                    "rating": round(3.5 + (i % 4) * 0.4, 1),
+                }
+                for i in range(1, 21)
+            ]
         products = []
         with open(PRODUCTS_CSV, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)

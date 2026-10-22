@@ -1,0 +1,11 @@
+# Cloud Build allowlist for producer.Dockerfile. Ignore everything first, then
+# include only files copied by the producer image build.
+**
+
+!.gcloudignore
+!producer.Dockerfile
+!requirements.txt
+!scripts/
+scripts/*
+!scripts/run_gap_filler.py
+!scripts/run_kafka_producer.py
