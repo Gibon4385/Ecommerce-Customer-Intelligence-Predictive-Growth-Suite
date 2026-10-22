@@ -6,6 +6,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 tests
+!tests/
+tests/*
+!tests/load/
+!tests/load/**
+!tests/cloud_e2e/
+!tests/cloud_e2e/**
+tests/cloud_e2e/config.yaml
 
 # macOS
 .DS_Store
@@ -47,3 +54,17 @@ logs/
 
 # spark
 spark_checkpoints/
+
+# practice playground
+practice/
+
+# Local architecture review document
+CLOUD_ARCHITECTURE_PLAN.md
+
+# Terraform local state, plans, caches, and manual backups
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+terraform/crash.*.log
