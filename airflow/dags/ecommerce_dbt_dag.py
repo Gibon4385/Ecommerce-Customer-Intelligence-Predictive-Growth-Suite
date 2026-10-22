@@ -20,6 +20,10 @@ DBT_PROFILES_DIR = os.environ.get("DBT_PROFILES_DIR", "/opt/airflow/dbt/ecommerc
 DBT_PROJECT = os.environ.get("DBT_PROJECT")
 ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "your-alerts-email@example.com")
 DBT_BIN = "/opt/airflow/venv_dbt/bin/dbt"
+DBT_PYTHON = "/opt/airflow/venv_dbt/bin/python"
+DBT_METRICS_PUBLISHER = os.path.join(
+    DBT_PROJECT_DIR, "..", "scripts", "publish_dbt_metrics.py"
+)
 
 
 # 3. Task Failure Callback
@@ -321,7 +325,34 @@ with DAG(
         },
     )
 
-    # Task 4: Parse results and send daily report notifications
+    # Task 4: Evaluate freshness for streaming sources. The separate target
+    # path preserves dbt_build's run_results.json for model/test metrics.
+    dbt_source_freshness = BashOperator(
+        task_id="dbt_source_freshness",
+        bash_command=(
+            f"cd {DBT_PROJECT_DIR} && {DBT_BIN} source freshness --target prod "
+            "--target-path target/freshness"
+        ),
+        env={
+            "DBT_PROJECT": DBT_PROJECT,
+            "DBT_PROFILES_DIR": DBT_PROFILES_DIR,
+            **os.environ,
+        },
+    )
+
+    # Task 5: Publish run_results.json and sources.json as custom metrics.
+    publish_monitoring_metrics = BashOperator(
+        task_id="publish_cloud_monitoring_metrics",
+        trigger_rule="all_done",
+        bash_command=(
+            f"{DBT_PYTHON} {DBT_METRICS_PUBLISHER} "
+            f"--project-id {DBT_PROJECT} "
+            f"--run-results {DBT_PROJECT_DIR}/target/run_results.json "
+            f"--sources {DBT_PROJECT_DIR}/target/freshness/sources.json"
+        ),
+    )
+
+    # Task 6: Parse results and send daily report notifications
     # This runs AFTER dbt_build completes successfully
     send_report = PythonOperator(
         task_id="send_daily_report",
@@ -329,4 +360,11 @@ with DAG(
     )
 
     # Define task dependencies
-    dbt_debug >> dbt_deps >> dbt_build >> send_report
+    (
+        dbt_debug
+        >> dbt_deps
+        >> dbt_build
+        >> dbt_source_freshness
+        >> publish_monitoring_metrics
+        >> send_report
+    )

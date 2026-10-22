@@ -53,6 +53,20 @@ jobs:
           cd ecommerce_dbt
           dbt build --target prod
 
+      - name: Check streaming source freshness
+        continue-on-error: true
+        run: |
+          cd ecommerce_dbt
+          dbt source freshness --target prod --target-path target/freshness
+
+      - name: Publish dbt metrics to Cloud Monitoring
+        if: always()
+        run: |
+          python scripts/publish_dbt_metrics.py \
+            --project-id "${DBT_PROJECT}" \
+            --run-results ecommerce_dbt/target/run_results.json \
+            --sources ecommerce_dbt/target/freshness/sources.json
+
       - name: Upload Manifest to GCS (for future Slim CI comparison)
         run: |
           gsutil cp ecommerce_dbt/target/manifest.json gs://${{ env.GCS_BUCKET }}/manifest.json
